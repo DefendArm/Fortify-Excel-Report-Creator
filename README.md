@@ -36,6 +36,10 @@ Each finding includes:
 
 The workbook contains an `all` worksheet and separate worksheets for each severity represented in the report. Columns support filtering, long text is wrapped, and the header remains visible while scrolling.
 
+## Contributing
+
+Issues and pull requests are welcome. If you find a bug, have an improvement in mind, or want to add support for another Fortify FPR format, please open an issue or submit a pull request.
+
 ## License
 
 This project is licensed under the [GNU Affero General Public License version 3](LICENSE).
