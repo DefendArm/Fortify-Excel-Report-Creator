@@ -1,15 +1,21 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+import argparse
+import html
+import re
 import xml.etree.ElementTree as ET
 from enum import Enum
-from zipfile import ZipFile
-from os import path,remove
-from re import sub
-import argparse
+from os import path
+from zipfile import BadZipFile, ZipFile
 
 try:
 	from xlsxwriter.workbook import Workbook
-except ImportError:
-	print("You should install xlsxwriter library, before using this script.")
+except ImportError as exc:
+	raise SystemExit(
+		"You should install the xlsxwriter library before using this script."
+	) from exc
+
+
+EXCEL_CELL_LIMIT = 32767
 
 
 class Severity(Enum):
@@ -18,247 +24,382 @@ class Severity(Enum):
 	HIGH = 3
 	CRITICAL = 4
 
-	
+
 class Rule:
-	def __init__(self, ruleId, probability, accuracy, impact):
+	def __init__(self, rule_id, probability, accuracy, impact):
 		self.probability = float(probability)
-		self.ruleId = ruleId
+		self.rule_id = rule_id
 		self.accuracy = float(accuracy)
 		self.impact = float(impact)
-	
-	def calculateSeverity(self, confidence, prob):
-		if (prob != -1):
-			self.probability = prob
-		likelihood = (self.accuracy * self.probability * confidence)/25
-		if self.impact >= 2.5:
-			if likelihood >= 2.5:
-				return Severity.CRITICAL
-			else:
-				return Severity.HIGH
-		else:
-			if likelihood >= 2.5:
-				return Severity.MEDIUM
-			else:
-				return Severity.LOW
-		
-	def getRuleId(self):
-		return self.ruleId
 
-		
+	def calculate_severity(self, confidence, probability):
+		effective_probability = self.probability if probability == -1 else probability
+		likelihood = (self.accuracy * effective_probability * confidence) / 25
+		if self.impact >= 2.5:
+			return Severity.CRITICAL if likelihood >= 2.5 else Severity.HIGH
+		return Severity.MEDIUM if likelihood >= 2.5 else Severity.LOW
+
+
 class Finding:
-	def __init__(self, kingdom, category, filename, severity, function="", line = 1):
+	def __init__(
+		self,
+		kingdom,
+		category,
+		filename,
+		severity,
+		function="",
+		line=1,
+		code_snippet="",
+		description="",
+		remediation="",
+		abstract="",
+		references="",
+	):
 		self.kingdom = kingdom
 		self.category = category
 		self.filename = filename
 		self.severity = severity
 		self.function = function
 		self.line = line
-		
-	def getSeverity(self):
-		return self.severity.value
-		
-	def getKingdom(self):
-		return self.kingdom
-		
+		self.code_snippet = code_snippet
+		self.description = description
+		self.remediation = remediation
+		self.abstract = abstract
+		self.references = references
+
+
+def _float_text(element, default=0.0):
+	return float(element.text) if element is not None and element.text else default
+
+
+def _clean_text(value):
+	"""Make Fortify's HTML-like description content readable in a cell."""
+	value = html.unescape(value or "")
+	value = value.replace("\r\n", "\n").replace("\r", "\n")
+	value = re.sub(r"[ \t]+", " ", value)
+	value = re.sub(r" *\n *", "\n", value)
+	value = re.sub(r"\n{3,}", "\n\n", value)
+	return value.strip()
+
+
+def render_description(value, replacements):
+	"""Render escaped Fortify Content XML, including finding placeholders."""
+	if not value:
+		return ""
+
+	try:
+		content = ET.fromstring(value)
+	except ET.ParseError:
+		# Some rule packs contain imperfect markup. Preserve their useful text.
+		fallback = re.sub(
+			r'<Replace\s+key=["\']([^"\']+)["\']\s*/>',
+			lambda match: replacements.get(match.group(1), ""),
+			value,
+			flags=re.IGNORECASE,
+		)
+		fallback = re.sub(
+			r"<AltParagraph\b[^>]*>.*?</AltParagraph>",
+			"",
+			fallback,
+			flags=re.IGNORECASE | re.DOTALL,
+		)
+		return _clean_text(re.sub(r"<[^>]+>", "", fallback))
+
+	block_tags = {"Content", "Paragraph", "AltParagraph", "pre", "p", "br", "li"}
+
+	def walk(element):
+		tag = element.tag.rsplit("}", 1)[-1]
+		if tag == "Replace":
+			return replacements.get(element.attrib.get("key", ""), "")
+		if tag == "AltParagraph":
+			return ""
+
+		parts = [element.text or ""]
+		for child in element:
+			child_tag = child.tag.rsplit("}", 1)[-1]
+			if child_tag in block_tags and parts and not parts[-1].endswith("\n"):
+				parts.append("\n")
+			parts.append(walk(child))
+			parts.append(child.tail or "")
+			if child_tag in block_tags:
+				parts.append("\n")
+		return "".join(parts)
+
+	return _clean_text(walk(content))
+
 
 class FPR:
-	def __init__(self, fprFile):
-		self.fprFile = fprFile
-		self.rules = []
+	def __init__(self, fpr_file):
+		self.fpr_file = fpr_file
+		self.rules = {}
+		self.descriptions = {}
+		self.source_entries = {}
+		self.source_encodings = {}
 		self.findings = []
-				
-	def getFindings(self):
-		return self.findings
-		
-	def getRules(self):
-		return self.rules
-		
-	def extractFVDL(self):
-		zip = ZipFile(self.fprFile, 'r')
+		self.archive = None
+		self.root = None
+
+	def process(self):
 		try:
-			zip.extract('audit.fvdl')
+			self.archive = ZipFile(self.fpr_file, "r")
+			xml_bytes = self.archive.read("audit.fvdl")
+		except (BadZipFile, KeyError) as exc:
+			if self.archive:
+				self.archive.close()
+			raise ValueError("Malformed FPR file: audit.fvdl was not found") from exc
+
+		# Removing only the default namespace keeps the XPath expressions readable.
+		xml_bytes = re.sub(br'\sxmlns="[^"]+"', b"", xml_bytes, count=1)
+		self.root = ET.fromstring(xml_bytes)
+		self._extract_source_index()
+		self._extract_rules()
+		self._extract_descriptions()
+		self._extract_findings()
+		self.archive.close()
+		return self.findings
+
+	def _extract_source_index(self):
+		for source_file in self.root.findall("Build/SourceFiles/File"):
+			name = source_file.findtext("Name")
+			if name:
+				self.source_encodings[name] = source_file.attrib.get("encoding", "utf-8")
+
+		try:
+			index = ET.fromstring(self.archive.read("src-archive/index.xml"))
+		except (KeyError, ET.ParseError):
+			return
+		for entry in index.findall("entry"):
+			if entry.text:
+				self.source_entries[entry.attrib.get("key", "")] = entry.text
+
+	def _extract_rules(self):
+		for rule_element in self.root.findall("EngineData/RuleInfo/Rule"):
+			values = {"Accuracy": 0.0, "Impact": 0.0, "Probability": 0.0}
+			for group in rule_element.findall("MetaInfo/Group"):
+				name = group.attrib.get("name")
+				if name in values and group.text:
+					values[name] = float(group.text)
+			rule_id = rule_element.attrib.get("id")
+			if rule_id:
+				self.rules[rule_id] = Rule(
+					rule_id,
+					values["Probability"],
+					values["Accuracy"],
+					values["Impact"],
+				)
+
+	def _extract_descriptions(self):
+		for description in self.root.findall("Description"):
+			class_id = description.attrib.get("classID")
+			if class_id:
+				self.descriptions[class_id] = description
+
+	def _primary_location(self, vulnerability):
+		primary = vulnerability.find("AnalysisInfo/Unified/Trace/Primary")
+		if primary is not None:
+			for node in primary.findall("Entry/Node"):
+				location = node.find("SourceLocation")
+				if location is not None and node.attrib.get("isDefault") == "true":
+					return location
+			location = primary.find("Entry/Node/SourceLocation")
+			if location is not None:
+				return location
+		return vulnerability.find(
+			"AnalysisInfo/Unified/Context/FunctionDeclarationSourceLocation"
+		)
+
+	def _source_snippet(self, filename, start_line, end_line):
+		archive_name = self.source_entries.get(filename)
+		if not archive_name:
+			return ""
+		try:
+			source = self.archive.read(archive_name)
 		except KeyError:
-			zip.close()
-			print("Malformed FPR file")
-		zip.close()
-	
-	
-	def processFVDL(self):
-		if not path.exists('audit.fvdl'):
-			print("Cannot perform the action, FVDL file is not found.")
-			return false
-		with open('audit.fvdl') as f:
-			xmlstring = f.read()
-		xmlstring = sub('\\sxmlns="[^"]+"', '', xmlstring, count=1)
-		self.root = ET.fromstring(xmlstring)
-	
-	
-	def extractRules(self):
-		ruls = self.root.findall('EngineData/RuleInfo/Rule')
-		
-		for rul in ruls:
-			ruleId = rul.attrib['id']
-			groups = rul.findall('MetaInfo/Group')
-			accuracy = 0.0
-			impact = 0.0
-			probability = 0.0
-			for group in groups:
-				if group.attrib['name'] == 'Accuracy':
-					accuracy = float(group.text)
-				elif group.attrib['name'] == 'Impact':
-					impact = float(group.text)
-				elif group.attrib['name'] == 'Probability':
-					probability = group.text
-			rule = Rule(ruleId, probability, accuracy, impact)
-			self.rules.append(rule)
-		
-		
-	def extractFindings(self):
-		vulns = self.root.findall('Vulnerabilities/Vulnerability')
-		for vuln in vulns:
-			kingdom = vuln.find('ClassInfo/Kingdom').text
-			category = vuln.find('ClassInfo/Type').text
-			if(vuln.find('ClassInfo/Subtype') != None):
-				category = category + ': ' + vuln.find('ClassInfo/Subtype').text
-			if(vuln.find('AnalysisInfo/Unified/Context/Function') != None):
-				filename = vuln.find('AnalysisInfo/Unified/Context/FunctionDeclarationSourceLocation').attrib['path']
-				function = vuln.find('AnalysisInfo/Unified/Context/Function').attrib['name']
-				line = vuln.find('AnalysisInfo/Unified/Context/FunctionDeclarationSourceLocation').attrib['line']
-			else:
-				filename = vuln.find('AnalysisInfo/Unified/Trace/Primary/Entry/Node/SourceLocation').attrib['path']
-				line = vuln.find('AnalysisInfo/Unified/Trace/Primary/Entry/Node/SourceLocation').attrib['line']
-				function = ""
-			classId = vuln.find('ClassInfo/ClassID').text
-			confidence = float(vuln.find('InstanceInfo/Confidence').text)
-			severity = Severity.LOW
-			self.extractRules()
+			return ""
+
+		encoding = self.source_encodings.get(filename, "utf-8")
+		try:
+			text = source.decode(encoding)
+		except (LookupError, UnicodeDecodeError):
+			text = source.decode("utf-8", errors="replace")
+		lines = text.splitlines()
+		start = max(1, start_line)
+		end = min(max(start, end_line), len(lines))
+		return "\n".join(
+			"{0}: {1}".format(number, lines[number - 1])
+			for number in range(start, end + 1)
+		)
+
+	def _references(self, description):
+		if description is None:
+			return ""
+		formatted = []
+		for reference in description.findall("References/Reference"):
+			title = (reference.findtext("Title") or "").strip()
+			author = (reference.findtext("Author") or "").strip()
+			source = (reference.findtext("Source") or "").strip()
+			line = title
+			if author:
+				line += (" — " if line else "") + author
+			if source:
+				line += (" — " if line else "") + source
+			if line:
+				formatted.append(line)
+		return "\n".join(formatted)
+
+	def _extract_findings(self):
+		for vulnerability in self.root.findall("Vulnerabilities/Vulnerability"):
+			class_info = vulnerability.find("ClassInfo")
+			class_id = class_info.findtext("ClassID")
+			kingdom = class_info.findtext("Kingdom", "")
+			category = class_info.findtext("Type", "")
+			subtype = class_info.findtext("Subtype")
+			if subtype:
+				category += ": " + subtype
+
+			context = vulnerability.find("AnalysisInfo/Unified/Context")
+			function_element = context.find("Function") if context is not None else None
+			function = function_element.attrib.get("name", "") if function_element is not None else ""
+			location = self._primary_location(vulnerability)
+			filename = location.attrib.get("path", "") if location is not None else ""
+			line = int(location.attrib.get("line", 1)) if location is not None else 1
+			line_end = int(location.attrib.get("lineEnd", line)) if location is not None else line
+
+			instance_info = vulnerability.find("InstanceInfo")
+			confidence = _float_text(instance_info.find("Confidence"))
 			probability = -1
-			if (vuln.find('InstanceInfo/MetaInfo') != None):
-				probability = float(vuln.find('InstanceInfo/MetaInfo/Group').text)
-			for rule in self.rules:
-				if rule.getRuleId() == classId:
-					severity = rule.calculateSeverity(confidence, probability)
-					break
-			finding = Finding(kingdom, category, filename, severity, function, line)
-			self.findings.append(finding)
+			probability_group = instance_info.find("MetaInfo/Group")
+			if probability_group is not None and probability_group.text:
+				probability = float(probability_group.text)
+			severity = Severity.LOW
+			rule = self.rules.get(class_id)
+			if rule:
+				severity = rule.calculate_severity(confidence, probability)
+
+			replacements = {}
+			for definition in vulnerability.findall(
+				"AnalysisInfo/Unified/ReplacementDefinitions/Def"
+			):
+				replacements[definition.attrib.get("key", "")] = definition.attrib.get("value", "")
+			description = self.descriptions.get(class_id)
+			abstract_text = description.findtext("Abstract") if description is not None else ""
+			explanation_text = description.findtext("Explanation") if description is not None else ""
+			remediation_text = description.findtext("Recommendations") if description is not None else ""
+
+			self.findings.append(
+				Finding(
+					kingdom,
+					category,
+					filename,
+					severity,
+					function,
+					line,
+					self._source_snippet(filename, line, line_end),
+					render_description(explanation_text, replacements),
+					render_description(remediation_text, replacements),
+					render_description(abstract_text, replacements),
+					self._references(description),
+				)
+			)
 
 
 class ReportWriter:
-	def writeWorksheet(self, workbook, name):
-		fs = self.orderFindings(name)
-		if len(fs) > 0:
-			worksheet = workbook.add_worksheet(name)
-			colNames = ['Risk Level', 'Kingdom', 'Category', 'File Path', 'Funtion', 'Line Number']
-			headerCF = self.generateCellFormat(workbook, True, 'white', 'blue')
-			self.addColumnNames(worksheet, colNames, headerCF)
-			criticalCF = self.generateCellFormat(workbook, True, 'white', '#8A0808')
-			highCF = self.generateCellFormat(workbook, True, 'white', '#FF0000')
-			mediumCF = self.generateCellFormat(workbook, True, 'white', 'orange')
-			lowCF = self.generateCellFormat(workbook, True, 'white', '#A4A4A4')
-			formats = [lowCF, mediumCF, highCF, criticalCF]
-			self.resizeWorksheet(worksheet, fs)
-			i = 2
-			for f in fs:
-				cf = workbook.add_format({'border':1})
-				worksheet.write("A" + str(i), f.severity.name.upper(), formats[f.severity.value - 1])
-				worksheet.write("B" + str(i), f.kingdom, cf)
-				worksheet.write("C" + str(i), f.category, cf)
-				worksheet.write("D" + str(i), f.filename, cf)
-				worksheet.write("E" + str(i), f.function, cf)
-				worksheet.write("F" + str(i), f.line, cf)
-				i = i + 1
-			worksheet.autofilter('A1:F' + str(len(fs)))
-	
-	
-	def resizeWorksheet(self, worksheet, fs):
-		kl = len('Kingdom')
-		cl = len('Category')
-		ful = len('Function')
-		fil = len('File Path')
-		for f in fs:
-			kl = max(kl, len(f.kingdom))
-			cl = max(cl, len(f.category))
-			ful = max(ful, len(f.function))
-			fil = max(fil, len(f.filename))
-		sl = len('Risk Level')
-		ll = len('Line Number')
-		worksheet.set_column('A:A', sl)
-		worksheet.set_column('B:B', kl)
-		worksheet.set_column('C:C', cl)
-		worksheet.set_column('D:D', fil)
-		worksheet.set_column('E:E', ful)
-		worksheet.set_column('F:F', ll)
-	
-	
-	def writeToExcel(self, findings, filename):
+	columns = [
+		("Risk Level", "severity", 12),
+		("Kingdom", "kingdom", 20),
+		("Category", "category", 38),
+		("File Path", "filename", 45),
+		("Function", "function", 24),
+		("Line Number", "line", 12),
+		("Code Snippet", "code_snippet", 60),
+		("Description", "description", 60),
+		("Remediation", "remediation", 60),
+		("Abstract", "abstract", 50),
+		("Reference", "references", 60),
+	]
+
+	def write_worksheet(self, workbook, name):
+		findings = self.order_findings(name)
+		if not findings:
+			return
+
+		worksheet = workbook.add_worksheet(name)
+		header_format = workbook.add_format(
+			{"border": 1, "bold": True, "font_color": "white", "bg_color": "blue"}
+		)
+		text_format = workbook.add_format(
+			{"border": 1, "text_wrap": True, "valign": "top"}
+		)
+		severity_formats = [
+			workbook.add_format({"border": 1, "bold": True, "font_color": "white", "bg_color": color})
+			for color in ("#A4A4A4", "orange", "#FF0000", "#8A0808")
+		]
+
+		for column, (heading, _, width) in enumerate(self.columns):
+			worksheet.write(0, column, heading, header_format)
+			worksheet.set_column(column, column, width)
+
+		for row, finding in enumerate(findings, start=1):
+			worksheet.write(
+				row,
+				0,
+				finding.severity.name,
+				severity_formats[finding.severity.value - 1],
+			)
+			for column, (_, attribute, _) in enumerate(self.columns[1:], start=1):
+				value = getattr(finding, attribute)
+				if isinstance(value, str) and len(value) > EXCEL_CELL_LIMIT:
+					value = value[: EXCEL_CELL_LIMIT - 14] + "\n[truncated]"
+				worksheet.write(row, column, value, text_format)
+
+		last_column = len(self.columns) - 1
+		worksheet.autofilter(0, 0, len(findings), last_column)
+		worksheet.freeze_panes(1, 0)
+
+	def write_to_excel(self, findings, filename):
 		self.findings = findings
 		workbook = Workbook(filename)
-		self.writeWorksheet(workbook, 'all')
-		self.writeWorksheet(workbook, 'critical')
-		self.writeWorksheet(workbook, 'high')
-		self.writeWorksheet(workbook, 'medium')
-		self.writeWorksheet(workbook, 'low')
+		for sheet_name in ("all", "critical", "high", "medium", "low"):
+			self.write_worksheet(workbook, sheet_name)
 		workbook.close()
-		
-		
-	def addColumnNames(self, worksheet, colNames, cell_format):
-		for i in range(0, len(colNames)):
-			worksheet.write(chr(ord('A') + i) + '1', colNames[i], cell_format)
-	
-	
-	def generateCellFormat(self, workbook, bold=False, fgcolor='black', bgcolor='white'):
-		cell_format = workbook.add_format({'border':1})
-		if bold:
-			cell_format.set_bold()
-		cell_format.set_font_color(fgcolor)
-		cell_format.set_bg_color(bgcolor)
-		return cell_format
-	
-	
-	def orderFindings(self, severity):
-		if severity == 'critical':
-			fs = list(filter(lambda x: x.severity.value == 4, self.findings))
-			fs = sorted(fs, key=lambda x: x.category)
-			return fs
-		elif severity == 'high':
-			fs = list(filter(lambda x: x.severity.value == 3, self.findings))
-			fs = sorted(fs, key=lambda x: x.category)
-			return fs
-		elif severity == 'medium':
-			fs = list(filter(lambda x: x.severity.value == 2, self.findings))
-			fs = sorted(fs, key=lambda x: x.category)
-			return fs
-		elif severity == 'low':
-			fs = list(filter(lambda x: x.severity.value == 1, self.findings))
-			fs = sorted(fs, key=lambda x: x.category)
-			return fs
-		else:
-			fs = sorted(self.findings, key=lambda x: ((-1*x.severity.value), x.category))
-			return fs
 
+	def order_findings(self, severity):
+		if severity == "all":
+			return sorted(
+				self.findings,
+				key=lambda finding: (-finding.severity.value, finding.category),
+			)
+		severity_value = Severity[severity.upper()].value
+		return sorted(
+			(finding for finding in self.findings if finding.severity.value == severity_value),
+			key=lambda finding: finding.category,
+		)
 
 
 def main(args):
-	fprfilename = args.input
 	fpr = FPR(args.input)
-	fpr.extractFVDL()
-	fpr.processFVDL()
-	fpr.extractFindings()
-	findings = fpr.getFindings()
-	writer = ReportWriter()
-	writer.writeToExcel(findings, fprfilename.replace('.fpr','.xlsx'))
-	remove('audit.fvdl')
-	
-if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description = 'This tool converts Fortify FPR reports to Excel reports.')
-	parser.add_argument('--input', '-i',
-		help='input Fortify .fpr report',
-		dest='input',
+	findings = fpr.process()
+	output_file = path.splitext(args.input)[0] + ".xlsx"
+	ReportWriter().write_to_excel(findings, output_file)
+	print("Created {0} with {1} findings.".format(output_file, len(findings)))
+
+
+if __name__ == "__main__":
+	parser = argparse.ArgumentParser(
+		description="Convert a Fortify FPR report to an Excel workbook."
+	)
+	parser.add_argument(
+		"--input",
+		"-i",
+		help="input Fortify .fpr report",
+		dest="input",
 		required=True,
 	)
-	args = parser.parse_args()
-	if path.exists(args.input) and path.isfile(args.input):
-		main(args)
+	arguments = parser.parse_args()
+	if path.isfile(arguments.input):
+		try:
+			main(arguments)
+		except (ET.ParseError, ValueError) as error:
+			parser.error(str(error))
 	else:
-		print("Could find the FPR file.")
-	
+		parser.error("Could not find the FPR file: {0}".format(arguments.input))
