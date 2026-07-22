@@ -133,6 +133,8 @@ class FPR:
 		self.fpr_file = fpr_file
 		self.rules = {}
 		self.descriptions = {}
+		self.snippets = {}
+		self.snippets_by_file = {}
 		self.source_entries = {}
 		self.source_encodings = {}
 		self.findings = []
@@ -154,6 +156,7 @@ class FPR:
 		self._extract_source_index()
 		self._extract_rules()
 		self._extract_descriptions()
+		self._extract_snippets()
 		self._extract_findings()
 		self.archive.close()
 		return self.findings
@@ -194,6 +197,31 @@ class FPR:
 			if class_id:
 				self.descriptions[class_id] = description
 
+	def _extract_snippets(self):
+		for snippet in self.root.findall("Snippets/Snippet"):
+			filename = snippet.findtext("File", "")
+			text = snippet.findtext("Text", "")
+			try:
+				start_line = int(snippet.findtext("StartLine", "1"))
+			except ValueError:
+				start_line = 1
+			try:
+				end_line = int(snippet.findtext("EndLine", str(start_line)))
+			except ValueError:
+				end_line = start_line
+
+			entry = {
+				"file": filename,
+				"start": start_line,
+				"end": end_line,
+				"text": text,
+			}
+			snippet_id = snippet.attrib.get("id")
+			if snippet_id:
+				self.snippets[snippet_id] = entry
+			if filename:
+				self.snippets_by_file.setdefault(filename, []).append(entry)
+
 	def _primary_location(self, vulnerability):
 		primary = vulnerability.find("AnalysisInfo/Unified/Trace/Primary")
 		if primary is not None:
@@ -227,6 +255,39 @@ class FPR:
 		end = min(max(start, end_line), len(lines))
 		return "\n".join(
 			"{0}: {1}".format(number, lines[number - 1])
+			for number in range(start, end + 1)
+		)
+
+	def _embedded_snippet(self, location, filename, start_line, end_line):
+		entry = None
+		if location is not None:
+			entry = self.snippets.get(location.attrib.get("snippet"))
+
+		if entry is None:
+			candidates = [
+				snippet
+				for snippet in self.snippets_by_file.get(filename, [])
+				if snippet["start"] <= start_line <= snippet["end"]
+			]
+			if candidates:
+				entry = min(
+					candidates,
+					key=lambda snippet: snippet["end"] - snippet["start"],
+				)
+
+		if entry is None or not entry["text"]:
+			return ""
+
+		lines = entry["text"].splitlines()
+		first_available = entry["start"]
+		last_available = first_available + len(lines) - 1
+		start = max(start_line, first_available)
+		end = min(max(start, end_line), last_available)
+		if start > last_available:
+			start = first_available
+			end = last_available
+		return "\n".join(
+			"{0}: {1}".format(number, lines[number - first_available])
 			for number in range(start, end + 1)
 		)
 
@@ -294,7 +355,8 @@ class FPR:
 					severity,
 					function,
 					line,
-					self._source_snippet(filename, line, line_end),
+					self._source_snippet(filename, line, line_end)
+					or self._embedded_snippet(location, filename, line, line_end),
 					render_description(explanation_text, replacements),
 					render_description(remediation_text, replacements),
 					render_description(abstract_text, replacements),

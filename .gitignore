@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Microsoft Office temporary files
+~$*
+
+# Local sample report artifacts
+AWSJavaSDKFortifyDemo/
+AWSJavaSDKFortifyDemo.fpr
+AWSJavaSDKFortifyDemo.xlsx
+AWSJavaSDKFortifyDemo.zip

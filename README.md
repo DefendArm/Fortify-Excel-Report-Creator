@@ -28,7 +28,7 @@ Each finding includes:
 - Risk level
 - Kingdom and category
 - File path, function, and vulnerable line number
-- Vulnerable code snippet from the source archive embedded in the FPR
+- Vulnerable code snippet from the source archive or FVDL snippet data embedded in the FPR
 - Description
 - Remediation guidance
 - Abstract
