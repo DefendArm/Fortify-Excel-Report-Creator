@@ -16,6 +16,7 @@ except ImportError as exc:
 
 
 EXCEL_CELL_LIMIT = 32767
+SNIPPET_CONTEXT_LINES = 2
 
 
 class Severity(Enum):
@@ -236,7 +237,17 @@ class FPR:
 			"AnalysisInfo/Unified/Context/FunctionDeclarationSourceLocation"
 		)
 
-	def _source_snippet(self, filename, start_line, end_line):
+	def _snippet_bounds(self, target_line, first_available, last_available):
+		if first_available > last_available:
+			return None
+		target = min(max(target_line, first_available), last_available)
+		window_size = (SNIPPET_CONTEXT_LINES * 2) + 1
+		start = max(first_available, target - SNIPPET_CONTEXT_LINES)
+		end = min(last_available, start + window_size - 1)
+		start = max(first_available, end - window_size + 1)
+		return start, end
+
+	def _source_snippet(self, filename, target_line):
 		archive_name = self.source_entries.get(filename)
 		if not archive_name:
 			return ""
@@ -251,14 +262,16 @@ class FPR:
 		except (LookupError, UnicodeDecodeError):
 			text = source.decode("utf-8", errors="replace")
 		lines = text.splitlines()
-		start = max(1, start_line)
-		end = min(max(start, end_line), len(lines))
+		bounds = self._snippet_bounds(target_line, 1, len(lines))
+		if bounds is None:
+			return ""
+		start, end = bounds
 		return "\n".join(
 			"{0}: {1}".format(number, lines[number - 1])
 			for number in range(start, end + 1)
 		)
 
-	def _embedded_snippet(self, location, filename, start_line, end_line):
+	def _embedded_snippet(self, location, filename, target_line):
 		entry = None
 		if location is not None:
 			entry = self.snippets.get(location.attrib.get("snippet"))
@@ -267,7 +280,7 @@ class FPR:
 			candidates = [
 				snippet
 				for snippet in self.snippets_by_file.get(filename, [])
-				if snippet["start"] <= start_line <= snippet["end"]
+				if snippet["start"] <= target_line <= snippet["end"]
 			]
 			if candidates:
 				entry = min(
@@ -281,11 +294,10 @@ class FPR:
 		lines = entry["text"].splitlines()
 		first_available = entry["start"]
 		last_available = first_available + len(lines) - 1
-		start = max(start_line, first_available)
-		end = min(max(start, end_line), last_available)
-		if start > last_available:
-			start = first_available
-			end = last_available
+		bounds = self._snippet_bounds(target_line, first_available, last_available)
+		if bounds is None:
+			return ""
+		start, end = bounds
 		return "\n".join(
 			"{0}: {1}".format(number, lines[number - first_available])
 			for number in range(start, end + 1)
@@ -324,8 +336,6 @@ class FPR:
 			location = self._primary_location(vulnerability)
 			filename = location.attrib.get("path", "") if location is not None else ""
 			line = int(location.attrib.get("line", 1)) if location is not None else 1
-			line_end = int(location.attrib.get("lineEnd", line)) if location is not None else line
-
 			instance_info = vulnerability.find("InstanceInfo")
 			confidence = _float_text(instance_info.find("Confidence"))
 			probability = -1
@@ -355,8 +365,8 @@ class FPR:
 					severity,
 					function,
 					line,
-					self._source_snippet(filename, line, line_end)
-					or self._embedded_snippet(location, filename, line, line_end),
+					self._source_snippet(filename, line)
+					or self._embedded_snippet(location, filename, line),
 					render_description(explanation_text, replacements),
 					render_description(remediation_text, replacements),
 					render_description(abstract_text, replacements),
