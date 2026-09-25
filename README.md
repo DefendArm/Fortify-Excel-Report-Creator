@@ -13,6 +13,8 @@ Install the dependency:
 python3 -m pip install xlsxwriter
 ```
 
+Run the tests with `python3 -m unittest discover -s tests`.
+
 ## Usage
 
 ```sh
@@ -33,8 +35,11 @@ Each finding includes:
 - Remediation guidance
 - Abstract
 - References
+- Fortify instance ID and rule class ID for tracing a finding back to the FPR
 
-The workbook contains an `all` worksheet and separate worksheets for each severity represented in the report. Columns support filtering, long text is wrapped, and the header remains visible while scrolling.
+The workbook begins with a `metadata` worksheet containing the project and build IDs, scan UUID and dates, engine version, scan duration, source file and line counts, finding counts by severity, and rule pack versions. Fields absent from an FPR are shown as `Not available`. Scan host, user, command-line arguments, and license details are intentionally omitted.
+
+The other worksheets contain `all` findings and separate sheets for each severity represented in the report. Columns support filtering, long text is wrapped, and the header remains visible while scrolling.
 
 ## Contributing
 

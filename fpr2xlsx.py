@@ -3,8 +3,9 @@ import argparse
 import html
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from enum import Enum
-from os import path
+from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 try:
@@ -17,6 +18,20 @@ except ImportError as exc:
 
 EXCEL_CELL_LIMIT = 32767
 SNIPPET_CONTEXT_LINES = 2
+
+
+def _text(element, query, default=""):
+	if element is None:
+		return default
+	return element.findtext(query, default) or default
+
+
+def _timestamp(element):
+	if element is None:
+		return ""
+	return " ".join(
+		part for part in (element.get("date", ""), element.get("time", "")) if part
+	)
 
 
 class Severity(Enum):
@@ -55,6 +70,8 @@ class Finding:
 		remediation="",
 		abstract="",
 		references="",
+		instance_id="",
+		class_id="",
 	):
 		self.kingdom = kingdom
 		self.category = category
@@ -67,6 +84,8 @@ class Finding:
 		self.remediation = remediation
 		self.abstract = abstract
 		self.references = references
+		self.instance_id = instance_id
+		self.class_id = class_id
 
 
 def _float_text(element, default=0.0):
@@ -138,29 +157,56 @@ class FPR:
 		self.snippets_by_file = {}
 		self.source_entries = {}
 		self.source_encodings = {}
+		self.source_lines = {}
 		self.findings = []
 		self.archive = None
 		self.root = None
+		self.metadata = {}
+		self.rule_packs = []
 
 	def process(self):
 		try:
-			self.archive = ZipFile(self.fpr_file, "r")
-			xml_bytes = self.archive.read("audit.fvdl")
+			with ZipFile(self.fpr_file) as archive:
+				self.archive = archive
+				xml_bytes = archive.read("audit.fvdl")
+				# Removing only the default namespace keeps the XPath expressions readable.
+				xml_bytes = re.sub(br'\sxmlns="[^"]+"', b"", xml_bytes, count=1)
+				self.root = ET.fromstring(xml_bytes)
+				self._extract_metadata()
+				self._extract_source_index()
+				self._extract_rules()
+				self._extract_descriptions()
+				self._extract_snippets()
+				self._extract_findings()
 		except (BadZipFile, KeyError) as exc:
-			if self.archive:
-				self.archive.close()
 			raise ValueError("Malformed FPR file: audit.fvdl was not found") from exc
-
-		# Removing only the default namespace keeps the XPath expressions readable.
-		xml_bytes = re.sub(br'\sxmlns="[^"]+"', b"", xml_bytes, count=1)
-		self.root = ET.fromstring(xml_bytes)
-		self._extract_source_index()
-		self._extract_rules()
-		self._extract_descriptions()
-		self._extract_snippets()
-		self._extract_findings()
-		self.archive.close()
+		finally:
+			self.archive = None
 		return self.findings
+
+	def _extract_metadata(self):
+		build = self.root.find("Build")
+		scan_time = build.find("ScanTime") if build is not None else None
+		self.metadata = {
+			"Input FPR": Path(self.fpr_file).name,
+			"Project label": _text(build, "Label"),
+			"Build ID": _text(build, "BuildID"),
+			"Scan UUID": _text(self.root, "UUID"),
+			"Scan created": _timestamp(self.root.find("CreatedTS")),
+			"Report written": _timestamp(self.root.find("WriteDate")),
+			"Engine version": _text(self.root, "EngineData/EngineVersion"),
+			"FVDL version": self.root.get("version", ""),
+			"Scan duration (seconds)": scan_time.get("value", "") if scan_time is not None else "",
+			"Source files": _text(build, "NumberFiles"),
+		}
+		if build is not None:
+			for loc in build.findall("LOC"):
+				if loc.get("type") in ("Fortify", "Line Count"):
+					self.metadata["Lines of code ({})".format(loc.get("type"))] = loc.text or ""
+		self.rule_packs = [
+			(_text(rule_pack, "Name"), _text(rule_pack, "Version"))
+			for rule_pack in self.root.findall("EngineData/RulePacks/RulePack")
+		]
 
 	def _extract_source_index(self):
 		for source_file in self.root.findall("Build/SourceFiles/File"):
@@ -248,20 +294,23 @@ class FPR:
 		return start, end
 
 	def _source_snippet(self, filename, target_line):
-		archive_name = self.source_entries.get(filename)
-		if not archive_name:
+		if filename not in self.source_lines:
+			archive_name = self.source_entries.get(filename)
+			if not archive_name:
+				return ""
+			try:
+				source = self.archive.read(archive_name)
+			except KeyError:
+				return ""
+			encoding = self.source_encodings.get(filename, "utf-8")
+			try:
+				text = source.decode(encoding)
+			except (LookupError, UnicodeDecodeError):
+				text = source.decode("utf-8", errors="replace")
+			self.source_lines[filename] = text.splitlines()
+		lines = self.source_lines[filename]
+		if not 1 <= target_line <= len(lines):
 			return ""
-		try:
-			source = self.archive.read(archive_name)
-		except KeyError:
-			return ""
-
-		encoding = self.source_encodings.get(filename, "utf-8")
-		try:
-			text = source.decode(encoding)
-		except (LookupError, UnicodeDecodeError):
-			text = source.decode("utf-8", errors="replace")
-		lines = text.splitlines()
 		bounds = self._snippet_bounds(target_line, 1, len(lines))
 		if bounds is None:
 			return ""
@@ -294,6 +343,8 @@ class FPR:
 		lines = entry["text"].splitlines()
 		first_available = entry["start"]
 		last_available = first_available + len(lines) - 1
+		if not first_available <= target_line <= last_available:
+			return ""
 		bounds = self._snippet_bounds(target_line, first_available, last_available)
 		if bounds is None:
 			return ""
@@ -323,6 +374,8 @@ class FPR:
 	def _extract_findings(self):
 		for vulnerability in self.root.findall("Vulnerabilities/Vulnerability"):
 			class_info = vulnerability.find("ClassInfo")
+			if class_info is None:
+				continue
 			class_id = class_info.findtext("ClassID")
 			kingdom = class_info.findtext("Kingdom", "")
 			category = class_info.findtext("Type", "")
@@ -337,9 +390,9 @@ class FPR:
 			filename = location.attrib.get("path", "") if location is not None else ""
 			line = int(location.attrib.get("line", 1)) if location is not None else 1
 			instance_info = vulnerability.find("InstanceInfo")
-			confidence = _float_text(instance_info.find("Confidence"))
+			confidence = _float_text(instance_info.find("Confidence") if instance_info is not None else None)
 			probability = -1
-			probability_group = instance_info.find("MetaInfo/Group")
+			probability_group = instance_info.find("MetaInfo/Group") if instance_info is not None else None
 			if probability_group is not None and probability_group.text:
 				probability = float(probability_group.text)
 			severity = Severity.LOW
@@ -371,6 +424,8 @@ class FPR:
 					render_description(remediation_text, replacements),
 					render_description(abstract_text, replacements),
 					self._references(description),
+					_text(instance_info, "InstanceID"),
+					class_id or "",
 				)
 			)
 
@@ -388,7 +443,46 @@ class ReportWriter:
 		("Remediation", "remediation", 60),
 		("Abstract", "abstract", 50),
 		("Reference", "references", 60),
+		("Instance ID", "instance_id", 40),
+		("Class ID", "class_id", 40),
 	]
+
+	def write_metadata(self, workbook, metadata, rule_packs, findings):
+		worksheet = workbook.add_worksheet("metadata")
+		worksheet.set_column("A:A", 30)
+		worksheet.set_column("B:B", 80)
+		worksheet.freeze_panes(1, 0)
+		section_format = workbook.add_format(
+			{"bold": True, "font_color": "white", "bg_color": "blue"}
+		)
+		label_format = workbook.add_format({"bold": True, "valign": "top"})
+		value_format = workbook.add_format({"text_wrap": True, "valign": "top"})
+		worksheet.merge_range(0, 0, 0, 1, "Scan metadata", section_format)
+		row = 1
+
+		def write_pair(label, value):
+			nonlocal row
+			worksheet.write_string(row, 0, label, label_format)
+			worksheet.write_string(row, 1, str(value) if value is not None and value != "" else "Not available", value_format)
+			row += 1
+
+		for label, value in metadata.items():
+			write_pair(label, value)
+
+		row += 1
+		worksheet.merge_range(row, 0, row, 1, "Finding summary", section_format)
+		row += 1
+		write_pair("Total findings", len(findings))
+		counts = Counter(finding.severity for finding in findings)
+		for severity in reversed(Severity):
+			write_pair(severity.name.title(), counts[severity])
+
+		if rule_packs:
+			row += 1
+			worksheet.merge_range(row, 0, row, 1, "Rule packs", section_format)
+			row += 1
+			for name, version in rule_packs:
+				write_pair(name or "Unnamed rule pack", version)
 
 	def write_worksheet(self, workbook, name):
 		findings = self.order_findings(name)
@@ -412,7 +506,7 @@ class ReportWriter:
 			worksheet.set_column(column, column, width)
 
 		for row, finding in enumerate(findings, start=1):
-			worksheet.write(
+			worksheet.write_string(
 				row,
 				0,
 				finding.severity.name,
@@ -422,15 +516,19 @@ class ReportWriter:
 				value = getattr(finding, attribute)
 				if isinstance(value, str) and len(value) > EXCEL_CELL_LIMIT:
 					value = value[: EXCEL_CELL_LIMIT - 14] + "\n[truncated]"
-				worksheet.write(row, column, value, text_format)
+				if isinstance(value, str):
+					worksheet.write_string(row, column, value, text_format)
+				else:
+					worksheet.write_number(row, column, value, text_format)
 
 		last_column = len(self.columns) - 1
 		worksheet.autofilter(0, 0, len(findings), last_column)
 		worksheet.freeze_panes(1, 0)
 
-	def write_to_excel(self, findings, filename):
+	def write_to_excel(self, findings, filename, metadata=None, rule_packs=None):
 		self.findings = findings
 		workbook = Workbook(filename)
+		self.write_metadata(workbook, metadata or {}, rule_packs or [], findings)
 		for sheet_name in ("all", "critical", "high", "medium", "low"):
 			self.write_worksheet(workbook, sheet_name)
 		workbook.close()
@@ -451,8 +549,8 @@ class ReportWriter:
 def main(args):
 	fpr = FPR(args.input)
 	findings = fpr.process()
-	output_file = path.splitext(args.input)[0] + ".xlsx"
-	ReportWriter().write_to_excel(findings, output_file)
+	output_file = str(Path(args.input).with_suffix(".xlsx"))
+	ReportWriter().write_to_excel(findings, output_file, fpr.metadata, fpr.rule_packs)
 	print("Created {0} with {1} findings.".format(output_file, len(findings)))
 
 
@@ -468,7 +566,7 @@ if __name__ == "__main__":
 		required=True,
 	)
 	arguments = parser.parse_args()
-	if path.isfile(arguments.input):
+	if Path(arguments.input).is_file():
 		try:
 			main(arguments)
 		except (ET.ParseError, ValueError) as error:
